@@ -1,0 +1,46 @@
+{
+  "runtime": {
+    "workers": 1,
+    "ranks": 1,
+    "threads": 1
+  },
+  "materials": [
+    {
+      "id": "Si-smoke",
+      "structure": "structures/Si.POSCAR",
+      "properties": {
+        "mechanical": {
+          "method": "vasp",
+          "preset": "quick",
+          "mesh": [4, 4, 4],
+          "encut": 400,
+          "kpar": 1,
+          "ncore": 1,
+          "stress_tol": 0.4
+        },
+        "optical": {
+          "structure_from": "mechanical",
+          "component": "isotropic",
+          "kmesh": [2, 2, 2],
+          "nbands": 64,
+          "nedos": 1000,
+          "omegamax": 8.0,
+          "ncore": 1,
+          "kpar": 1
+        }
+      }
+    },
+    {
+      "id": "BaTiO3-smoke",
+      "structure": "structures/BaTiO3.polar.POSCAR",
+      "properties": {
+        "ferroelectric": {
+          "reference": "structures/BaTiO3.reference.POSCAR",
+          "mirror": true,
+          "variants": {"Ba": "Ba_sv", "Ti": "Ti_sv"},
+          "preset": "fast"
+        }
+      }
+    }
+  ]
+}
