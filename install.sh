@@ -57,10 +57,12 @@ required=(
     mechanical_adapter.py
     optical_adapter.py
     examples/smoke.json
+    examples/discovery.json
     examples/structures/Si.POSCAR
     examples/structures/BaTiO3.reference.POSCAR
     examples/structures/BaTiO3.polar.POSCAR
     vendor/MechanicalProperties/elastic_workflow.py
+    vendor/MechanicalProperties/mechanical_convergence.py
     vendor/MechanicalProperties/mech.py
     vendor/MechanicalProperties/mechanical_fit.py
     vendor/MechanicalProperties/mechanical_inputs.py
@@ -68,9 +70,17 @@ required=(
     vendor/OpticalProperties/optics.py
     vendor/OpticalProperties/optical_workflow/__init__.py
     vendor/OpticalProperties/optical_workflow/__main__.py
+    vendor/OpticalProperties/optical_workflow/convergence.py
+    vendor/OpticalProperties/optical_workflow/convergence_metrics.py
+    vendor/OpticalProperties/optical_workflow/convergence_report.py
     vendor/OpticalProperties/optical_workflow/inputs.py
     vendor/OpticalProperties/optical_workflow/results.py
     vendor/ferroelectricity-dft/scripts/fe_analysis.py
+    vendor/ferroelectricity-dft/scripts/fe_mp_api.py
+    vendor/ferroelectricity-dft/scripts/fe_mp_geometry.py
+    vendor/ferroelectricity-dft/scripts/fe_mp_parent.py
+    vendor/ferroelectricity-dft/scripts/fe_mp_resolve.py
+    vendor/ferroelectricity-dft/scripts/fe_optics.py
     vendor/ferroelectricity-dft/scripts/fe_structures.py
     vendor/ferroelectricity-dft/scripts/fe_vasp_jobs.py
     vendor/ferroelectricity-dft/scripts/fe_workflow.py

@@ -38,7 +38,7 @@ materials-pipeline run "$sample" --out "$output"
 
 `doctor` checks the environment. `prepare` generates or previews inputs without launching VASP. `run` starts VASP and writes results. The bundled diamond silicon and tetragonal BaTiO₃ structures are idealized geometries intended for a workflow smoke test.
 
-Launch `materials-pipeline` without arguments to open the terminal menu. The `materials-pipline` alias opens the same menu. Choose 1 through 3 for polarization, optics, or mechanics, or choose 4 for the full manifest. The submenu offers preparation and execution. Choose 11 to check the environment, 12 to view the latest summary in a directory, and 0 to exit. Enter accepts the displayed defaults, including `./runs/<manifest-stem>` for the output directory.
+Launch `materials-pipeline` without arguments to open the terminal menu. The `materials-pipline` alias opens the same menu. Choose 1 through 3 for polarization, optics, or mechanics, or choose 4 for the full manifest. The submenu offers preparation and execution. Choose 11 for the environment check, 12 for the latest batch summary, 13 for ferroelectric structure discovery, or 0 to exit. Enter accepts the displayed defaults, including `./runs/<manifest-stem>` for the output directory.
 
 ## Define a batch
 
@@ -76,6 +76,33 @@ To set machine-specific paths, use `runtime.vasp`, `runtime.mpi`, `runtime.pytho
 
 Ferroelectric and optical POSCAR files should include element names in VASP 5/6 format. The polarization path needs a suitable nonpolar reference and consistent atom mapping. The sampled energy maximum describes the chosen path. The optical calculation uses the independent-particle electronic response, and the elastic workflow targets three-dimensional ordered bulk systems near zero applied pressure. For research runs, check convergence against k meshes, cutoff energies, optical empty bands, polarization path sampling, and strain amplitudes as applicable.
 
+## Discover ferroelectric structures
+
+A `ferroelectric` stage can use `formula` or `material_id` to select a polar endpoint and a nonpolar reference from Materials Project. Either query replaces the local `reference`, `polar`, and `opposite` inputs. A top-level `structure` is optional when every enabled stage can obtain its structure from the query or an upstream stage. The bundled `examples/discovery.json` shows a formula search with an optical follow-up.
+
+```bash
+read -rsp 'Materials Project API key: ' MP_API_KEY
+printf '\n'
+export MP_API_KEY
+manifest="$HOME/.local/share/materials-pipeline/examples/discovery.json"
+materials-pipeline discover "$manifest" --out runs/batio3
+```
+
+`discover` writes candidate pairs and aligned POSCARs without starting VASP. If the status is `needs_selection`, open the candidate report listed in the summary and copy the complete `selection` value for a suitable pair into the material's `ferroelectric` settings. You can also narrow the search using `polar_id` and `reference_id`. Review the structural match before submitting a calculation. Use the same output directory for later `prepare` or `run` calls to keep the downloaded records available. A custom `mp_cache` can point to a cache directory or a local Materials Project response JSON. Use `refresh_mp: true` to refresh a directory cache when appropriate.
+
+Set `"structure_from": "ferroelectric"` in `optical` or `mechanical` to use the selected polar endpoint. In preparation mode the endpoint is available once the ferroelectric inputs are prepared. In run mode the pipeline requires a completed ferroelectric stage before starting the dependent stage. Explicit optical `potentials` or mechanical `potcars` entries can override inherited PAW variant names. Selecting a dependent stage also selects its prerequisites.
+
+## Check convergence
+
+Optical and elastic convergence are optional. Ordinary screening can use the original single-calculation settings.
+
+| Stage | Manifest options | Comparison and report |
+| --- | --- | --- |
+| `optical` | Set `convergence: true` for defaults, or supply an object. Available keys are `window_eV` (default `[0, 8]`), `rtol` (0.05), `atol` (0.02), `k_growth` (1.4), `k_steps` (5), `kmeshes` (explicit finer meshes), `band_growth` (1.4), and `band_steps` (3). | Compare the dielectric spectra while independently refining the k mesh and total band count. The report includes component errors, the tested spectra, and a plot. |
+| `mechanical` | Set `converge: true` to enable the checks. Set `convergence_tol_gpa`, `convergence_max_rounds`, `convergence_k_step`, and `convergence_encut_step` to override the defaults of 1 GPa, 3 rounds, 2 mesh points per axis, and 80 eV. | Check k-mesh and cutoff changes independently against the maximum absolute difference among the 36 stiffness entries. The JSON report records the tested settings and tensor differences. |
+
+The summary records the convergence status and links to the report and final available spectrum or elastic tensor. A stage marked `not_converged` exhausted its configured budget. Repeat with the same inputs and output directory to reuse matching jobs when adjusting tolerances or budgets.
+
 ## Run and inspect a batch
 
 ```bash
@@ -83,13 +110,13 @@ materials-pipeline run batch.json --out results/batch-01 --workers 2
 materials-pipeline run batch.json --out results/batch-01 --material silicon --property optical
 ```
 
-- Both selection flags can be repeated. Selecting an optical stage with `structure_from: mechanical` also selects its mechanical prerequisite. During preparation, such an optical stage is marked `deferred`.
+- Both selection flags can be repeated. Selecting a stage with `structure_from` also selects the prerequisites it needs. A stage that requires a relaxed mechanical structure is marked `deferred` during preparation.
 - The pipeline runs at most one stage at a time for each material. Allow `workers × ranks × threads` logical CPUs for the active workers and account for memory and scratch space separately. The optical workflow uses one thread per rank.
-- The output directory contains `prepare-summary.csv` and `prepare-summary.json` after preparation, and `run-summary.csv` and `run-summary.json` after execution. Each row links to the stage log, result, and output directory when available. Open `request.json` in the stage directory for the input hashes and runtime settings.
+- The output directory contains CSV and JSON summaries named for the action, such as `discover-summary.json`, `prepare-summary.json`, or `run-summary.json`. Each row links to the stage log, result, and output directory when available. Open `request.json` in the stage directory for the input hashes and runtime settings.
 - A `completed` stage passed the workflow checks. A `review` stage produced a result that needs inspection. `blocked` indicates an unavailable prerequisite or an unmet physics check, and `failed` indicates an error. Inspect `driver.log` and the relevant VASP logs. Independent jobs continue when a stage fails.
 - To resume or reuse completed work, repeat the command with the same inputs and output directory. Changed inputs or settings produce a separate stage directory. Use a different output root for each simultaneous batch.
 
-CLI exit codes are 0 for completion with no failed or blocked stages, 1 for a failed or blocked stage, 2 for an invalid environment or manifest, and 130 for interruption. Inspect the summary even on exit 0 to find any `review` results.
+CLI exit codes are 0 for completion, 1 for a failed, blocked, or not-converged stage, 2 for an invalid environment or manifest, 3 when the outstanding issue is a candidate selection, and 130 for interruption. Inspect the summary even on exit 0 to find any `review` results.
 
 Mechanical input preparation writes licensed `POTCAR` data into job directories. Keep the output tree local. To share results, select only the intended files and review them for local paths and licensed data.
 

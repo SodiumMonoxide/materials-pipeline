@@ -1,4 +1,4 @@
-"""Use the previous relaxed-ion elastic workflow as the mechanical stage."""
+"""Adapt the relaxed-ion elasticity workflow and its optional convergence check."""
 
 import json
 import os
@@ -81,7 +81,10 @@ def run(ctx):
     if not native_report.is_file():
         return {"status": "failed", "message": f"Mechanical workflow exited with {rc}; see stage log"}
     entry = _report(native_report, ctx.material_id)
-    if rc or entry["status"] == "error":
+    native_status = entry["status"]
+    valid_statuses = {"prepared"} if ctx.prepare else {"ok", "not_converged"}
+    not_converged = native_status == "not_converged"
+    if native_status not in valid_statuses or rc != int(not_converged):
         return {"status": "failed", "result": str(native_report),
                 "message": entry.get("error") or f"Mechanical workflow exited with {rc}; see stage log"}
     if ctx.prepare:
@@ -95,8 +98,16 @@ def run(ctx):
     if not structure.is_file():
         raise ValueError(f"validated elastic reference structure missing: {structure}")
     stability = elastic["stability"]
+    diagnostics = []
+    if not_converged:
+        diagnostics.append("Elastic k mesh and cutoff convergence was not reached")
+    if stability != "positive_definite":
+        diagnostics.append(f"Elastic stiffness requires review ({stability})")
+    status = "review" if diagnostics else "completed"
+    if not_converged:
+        status = "not_converged"
     outcome = {
-        "status": "completed" if stability == "positive_definite" else "review",
+        "status": status,
         "result": str(result_path),
         "structure": str(structure),
         "metrics": {
@@ -106,6 +117,10 @@ def run(ctx):
             **(elastic["vrh"] or {}),
         },
     }
-    if outcome["status"] == "review":
-        outcome["message"] = f"Elastic stiffness requires review ({stability})"
+    if convergence := entry.get("convergence"):
+        outcome["convergence_report"] = str(native / convergence["report"])
+        outcome["convergence_status"] = convergence["status"]
+        outcome["metrics"]["elastic_convergence_rounds"] = convergence["rounds"]
+    if diagnostics:
+        outcome["message"] = ". ".join(diagnostics)
     return outcome

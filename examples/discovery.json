@@ -1,0 +1,14 @@
+{
+  "materials": [
+    {
+      "id": "BaTiO3-search",
+      "properties": {
+        "ferroelectric": {
+          "formula": "BaTiO3",
+          "variants": {"Ba": "Ba_sv", "Ti": "Ti_sv"}
+        },
+        "optical": {"structure_from": "ferroelectric"}
+      }
+    }
+  ]
+}

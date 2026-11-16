@@ -29,13 +29,17 @@ DEFAULTS = {
     "preset": "fast", "sigma": 0.03, "nelm": 140, "dipol": [0.25, 0.25, 0.25],
     "ranks": 4, "jobs": 2, "min_gap": 0.05, "occ_tol": 0.001,
     "max_displacement": 1.5, "symprec": 0.01, "quantum_multiple": 1,
+    "mp_symprec": 0.03, "mp_max_strain": 0.08,
     "mirror": False, "ordered": False, "probe": True,
     "launcher": ["mpirun", "-np", "{ranks}", "--bind-to", "none"],
 }
 OPTIONS = DEFAULTS.keys() | PRESETS["fast"].keys() | {
-    "vasp", "paw_dir", "potcar", "variants", "encut", "kmesh", "kpar",
+    "vasp", "paw_dir", "potcar", "variants", "encut", "kmesh", "kpar", "mp_cache", "optics",
 }
-CASE_FIELDS = OPTIONS | {"id", "reference", "polar", "opposite"}
+CASE_FIELDS = OPTIONS | {
+    "id", "reference", "polar", "opposite", "formula", "material_id", "polar_id",
+    "reference_id", "selection",
+}
 
 
 def digest(blob):
@@ -88,6 +92,7 @@ def case_options(defaults, case, overrides, base):
     if not isinstance(preset, str) or preset not in PRESETS:
         raise ValueError("preset must be fast or standard")
     values = {**DEFAULTS, **PRESETS[preset], **configured}
+    values["infer_mirror"] = "mirror" not in configured
     if ("kspacing" in overrides
             or ("kspacing" in case and "kmesh" not in case and "kmesh" not in overrides)):
         values.pop("kmesh", None)
@@ -98,7 +103,7 @@ def case_options(defaults, case, overrides, base):
         if key in values:
             scalar(values[key], key, integer=True)
     for key in ("kspacing", "ediff", "sigma", "encut_factor", "encut", "symprec",
-                "max_displacement"):
+                "max_displacement", "mp_symprec", "mp_max_strain"):
         if key in values:
             scalar(values[key], key)
     for key in ("min_gap", "occ_tol"):
@@ -123,19 +128,31 @@ def case_options(defaults, case, overrides, base):
         raise ValueError("launcher must be an array of argument strings")
     if not launcher and values["ranks"] != 1:
         raise ValueError("direct launch requires ranks=1")
-    for key in ("reference", "polar", "opposite", "potcar"):
+    if values["mp_max_strain"] >= 1:
+        raise ValueError("mp_max_strain is a fractional strain and must be below 1")
+    for key in ("reference", "polar", "opposite", "potcar", "mp_cache"):
         if key in values:
             values[key] = path_from(values[key], base, key)
-    vasp = values.get("vasp", os.environ.get("VASP_EXE", "vasp_std"))
+    vasp = values.get("vasp", os.environ.get("VASP_EXECUTABLE") or os.environ.get("VASP_EXE") or "vasp_std")
     if not isinstance(vasp, str) or not vasp:
         raise ValueError("vasp must be a command name or path")
     values["vasp"] = str(path_from(vasp, base, "vasp")) if "/" in vasp or "$" in vasp else vasp
-    paw = values.get("paw_dir", os.environ.get("VASP_PSP_DIR"))
+    paw = values.get("paw_dir", os.environ.get("VASP_POTCAR_ROOT") or os.environ.get("VASP_PSP_DIR"))
     values["paw_dir"] = path_from(paw, base, "paw_dir") if paw else None
     for source in (defaults.get("variants", {}), case.get("variants", {})):
         if not isinstance(source, dict) or any(not isinstance(v, str) or not v for v in source.values()):
             raise ValueError("variants must map element symbols to PAW subdirectory names")
     values["variants"] = {**defaults.get("variants", {}), **case.get("variants", {})}
+    structure_query = set(values) & {"formula", "material_id"}
+    mp_fields = {"polar_id", "reference_id", "selection"}
+    for key in structure_query | (mp_fields & values.keys()):
+        if not isinstance(values[key], str) or not values[key].strip():
+            raise ValueError(f"{key} must be a nonempty string")
+        values[key] = values[key].strip()
+    if len(structure_query) > 1 or (structure_query and {"reference", "polar", "opposite"} & values.keys()):
+        raise ValueError("use one formula or MP ID, or supply the local structure files")
+    if not structure_query and mp_fields & values.keys():
+        raise ValueError("MP pair selection requires a formula or material_id")
     return values
 
 
@@ -181,10 +198,11 @@ def prepare(case_root, values):
     )
     kpoints = f"Gamma-centered mesh\n0\nGamma\n{' '.join(map(str, mesh))}\n0 0 0\n"
     return install_plan(case_root, lattice, geometry, potential_info, encut, mesh, kpar,
-                        frames, incar, kpoints), potentials
+                        frames, incar, kpoints, values.get("structure_source")), potentials
 
 
-def install_plan(root, lattice, geometry, potential_info, encut, mesh, kpar, frames, incar, kpoints):
+def install_plan(root, lattice, geometry, potential_info, encut, mesh, kpar, frames, incar, kpoints,
+                 structure_source):
     inputs = {}
     manifest = io.StringIO(newline="")
     writer = csv.writer(manifest, lineterminator="\n")
@@ -202,6 +220,8 @@ def install_plan(root, lattice, geometry, potential_info, encut, mesh, kpar, fra
         "encut_ev": encut, "kmesh": mesh, "kpar": kpar, "images": names,
         "input_sha256": {name: digest(blob) for name, blob in inputs.items()},
     }
+    if structure_source is not None:
+        plan["structure_source"] = structure_source
     plan = json.loads(json.dumps(plan, allow_nan=False))
     if root.exists():
         saved = read_plan(root)
@@ -236,7 +256,45 @@ def set_status(root, state, **detail):
     return status
 
 
-def run_case(action, root, values):
+def query_case(query, kind=None, identifier=None):
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("material query must be a nonempty string")
+    query = query.strip()
+    if kind is None:
+        kind = "material_id" if re.fullmatch(r"(?:mp|mvc)-[A-Za-z0-9]+", query, re.I) else "formula"
+    label = query.translate(str.maketrans("₀₁₂₃₄₅₆₇₈₉", "0123456789"))
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "-", label).strip("-.") or "material"
+    return {"id": identifier or name, kind: query}
+
+
+def run_case(action, root, values, *, choose=False, refresh=False):
+    if action != "analyze" and ("formula" in values or "material_id" in values):
+        from fe_mp_resolve import resolve
+
+        by_id = "material_id" in values
+        database = root.parent / "_mp"
+        try:
+            resolution = resolve(
+                database / root.name, values.get("mp_cache", database / "cache"),
+                query=values["material_id" if by_id else "formula"], by_id=by_id,
+                symprec=values["mp_symprec"], max_strain=values["mp_max_strain"],
+                max_displacement=values["max_displacement"], polar_id=values.get("polar_id"),
+                reference_id=values.get("reference_id"), selector=values.get("selection"),
+                choose=choose, refresh=refresh,
+            )
+        except (OSError, ValueError, RuntimeError, ArithmeticError) as error:
+            return {"case": root.name, "status": "structure_error", "message": str(error)}
+        result = {key: val for key, val in resolution.items()
+                  if key not in {"reference", "polar", "mirror"}}
+        if action == "discover" or resolution["status"] != "resolved":
+            return {"case": root.name, **result}
+        for key in ("reference", "polar", "structure_source"):
+            values[key] = resolution[key]
+        if values["infer_mirror"]:
+            values["mirror"] = resolution["mirror"]
+    elif action == "discover":
+        return {"case": root.name, "status": "manual_structures"}
+
     try:
         if action == "analyze":
             plan = read_plan(root)
@@ -244,9 +302,10 @@ def run_case(action, root, values):
             plan, potentials = prepare(root, values)
     except (OSError, ValueError, KeyError, ArithmeticError) as error:
         return {"case": root.name, "status": "input_error", "message": str(error)}
+    source = {"structure_source": plan["structure_source"]} if "structure_source" in plan else {}
     if action == "prepare":
         return {"case": root.name, "status": "prepared", "images": len(plan["images"]),
-                "encut_ev": plan["encut_ev"], "kmesh": plan["kmesh"]}
+                "encut_ev": plan["encut_ev"], "kmesh": plan["kmesh"], **source}
 
     (root / "summary.json").unlink(missing_ok=True)
     set_status(root, "running" if action == "run" else "analyzing")
@@ -291,6 +350,7 @@ def run_case(action, root, values):
             inversion_switch_delta_c_m2=polarization["inversion_switch_delta_c_m2"],
             maximum_energy_above_first_ev_cell=result["energy"]["above_first_ev_cell"],
             warnings=len(result["warnings"]),
+            **source,
         )
     except (OSError, ValueError, RuntimeError, ArithmeticError) as error:
         return set_status(root, f"{stage}_error", message=str(error),
@@ -298,9 +358,23 @@ def run_case(action, root, values):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("prepare", "run", "analyze"))
-    parser.add_argument("config", type=Path)
+    if sys.argv[1:2] == ["optics"]:
+        from fe_optics import main as optical_main
+
+        return optical_main(sys.argv[2:])
+    parser = argparse.ArgumentParser(description=__doc__, epilog="For optical convergence: %(prog)s optics --help")
+    parser.add_argument("action", choices=("discover", "prepare", "run", "analyze"))
+    parser.add_argument("config", type=Path, nargs="?")
+    query = parser.add_mutually_exclusive_group()
+    query.add_argument("--formula", help="resolve an MP chemical formula directly")
+    query.add_argument("--material-id", help="resolve an MP material ID directly")
+    parser.add_argument("--id", help="case directory name for a direct query")
+    parser.add_argument("--select", dest="selection", help="select a candidate key in a single case")
+    parser.add_argument("--polar-id", help="pin the polar MP ID in a single case")
+    parser.add_argument("--reference-id", help="pin the reference MP ID in a single case")
+    parser.add_argument("--choose", action="store_true", help="prompt in a terminal when several pairs match")
+    parser.add_argument("--refresh-mp", action="store_true", help="replace the cached MP query response")
+    parser.add_argument("--mp-cache", type=Path, help="shared MP cache directory or local response JSON")
     parser.add_argument("--case", action="append", dest="selected", help="run selected IDs, repeatable")
     parser.add_argument("--output", type=Path, help="override the batch output directory")
     parser.add_argument("--preset", choices=PRESETS)
@@ -313,43 +387,65 @@ def main():
         parser.add_argument(f"--{key.replace('_', '-')}", type=float)
     args = parser.parse_args()
     try:
-        config = fields(json.loads(args.config.read_text(encoding="utf-8-sig")),
-                        {"output", "defaults", "cases"}, "config")
+        config = {}
+        if args.config:
+            config = fields(json.loads(args.config.read_text(encoding="utf-8-sig")),
+                            {"output", "defaults", "cases"}, "config")
         defaults = fields(config.get("defaults", {}), OPTIONS, "defaults")
         cases = config.get("cases")
+        if args.formula is not None or args.material_id is not None:
+            direct = args.material_id if args.material_id is not None else args.formula
+            kind = "material_id" if args.material_id is not None else "formula"
+            cases = [query_case(direct, kind, args.id)]
+        elif args.id:
+            raise ValueError("--id is only used with a direct formula or MP ID query")
         if not isinstance(cases, list) or not cases:
-            raise ValueError("cases must be a nonempty array")
-        ids = set()
+            raise ValueError("supply a nonempty case configuration or a direct formula/MP ID query")
+        ids, parsed_cases = set(), []
         for entry in cases:
-            case = fields(entry, CASE_FIELDS, "case")
+            case = query_case(entry) if isinstance(entry, str) else fields(entry, CASE_FIELDS, "case")
+            if "id" not in case:
+                query_fields = set(case) & {"material_id", "formula"}
+                if len(query_fields) == 1:
+                    kind = query_fields.pop()
+                    case = {**query_case(case[kind], kind), **case}
             ident = case.get("id")
             if (not isinstance(ident, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", ident)
                     or ident.casefold() in ids):
                 raise ValueError(f"invalid or repeated case ID: {ident!r}")
             ids.add(ident.casefold())
+            parsed_cases.append(case)
         selected = {identifier.casefold() for identifier in args.selected or ()}
         if selected - ids:
             raise ValueError(f"unknown case IDs: {', '.join(sorted(selected - ids))}")
         overrides = {key: value for key, value in vars(args).items() if key in OPTIONS and value is not None}
+        if args.mp_cache is not None:
+            overrides["mp_cache"] = str(args.mp_cache.resolve())
+        pair_overrides = {key: getattr(args, key) for key in ("polar_id", "reference_id", "selection")
+                          if getattr(args, key) is not None}
+        if pair_overrides and len(selected or ids) != 1:
+            raise ValueError("candidate overrides require a single selected case")
+        overrides.update(pair_overrides)
         if args.action == "analyze" and overrides.keys() - {"min_gap"}:
             raise ValueError("analyze uses the calculation settings saved in plan.json")
-        base = args.config.resolve().parent
+        base = args.config.resolve().parent if args.config else Path.cwd()
         output = args.output.resolve() if args.output else path_from(config.get("output", "fe-runs"), base, "output")
         output.mkdir(parents=True, exist_ok=True)
-        good = {"prepared", "passed", "review"}
+        good = {"prepared", "passed", "review", "resolved", "manual_structures"}
         with (output / ".fe.lock").open("a") as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise ValueError(f"{output}: another workflow is using this batch directory") from None
             results = []
-            for entry in cases:
+            for entry in parsed_cases:
                 ident = entry["id"]
                 if selected and ident.casefold() not in selected:
                     continue
                 try:
                     values = case_options(defaults, entry, overrides, base)
-                    result = run_case(args.action, output / ident, values)
+                    result = run_case(args.action, output / ident, values, choose=args.choose,
+                                      refresh=args.refresh_mp)
                 except (ValueError, OSError, ArithmeticError) as error:
                     result = {"case": ident, "status": "input_error", "message": str(error)}
                 results.append(result)
@@ -357,7 +453,10 @@ def main():
                 if "message" in result:
                     print(f"  {result['message']}", file=sys.stderr, flush=True)
             atomic_json(output / "batch-summary.json", {"action": args.action, "cases": results})
-        return int(any(result["status"] not in good for result in results))
+        statuses = {result["status"] for result in results}
+        if statuses - good - {"needs_selection"}:
+            return 1
+        return 3 if "needs_selection" in statuses else 0
     except (ValueError, OSError) as error:
         parser.exit(2, f"error: {error}\n")
 

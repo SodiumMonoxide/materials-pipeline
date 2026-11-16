@@ -13,6 +13,7 @@ from pipeline import ROOT, resolve_path, run_cli
 
 
 EXAMPLE = ROOT / "examples" / "smoke.json"
+DISCOVERY = ROOT / "examples" / "discovery.json"
 CALCULATIONS = {
     "1": ("ferroelectric", "铁电极化"),
     "2": ("optical", "光学性质"),
@@ -63,6 +64,7 @@ def show_menu():
         menu_row(f" {first}) {CALCULATIONS[first][1]}", f" {second}) {CALCULATIONS[second][1]}", width)
     section("批次工具", width)
     menu_row("11) 环境检查", "12) 查看批次汇总", width)
+    print("13) 检索铁电候选结构")
     print(" 0) 退出\n")
 
 
@@ -88,8 +90,8 @@ class Selection:
     manifest: Path = EXAMPLE
     output: Path = suggested_output(EXAMPLE)
 
-    def ask_manifest(self):
-        manifest = ask_path("清单路径", self.manifest)
+    def ask_manifest(self, default=None):
+        manifest = ask_path("清单路径", default or self.manifest)
         if manifest != self.manifest:
             self.manifest = manifest
             self.output = suggested_output(manifest)
@@ -111,14 +113,15 @@ def run_in_menu(args):
         for sig, handler in handlers.items():
             signal.signal(sig, handler)
     print({0: "操作结束。", 1: "部分任务需要处理，请查看批次汇总。",
-           2: "请检查上方的配置或环境错误。", 130: "操作已中断。"}.get(status, f"退出码 {status}"))
+           2: "请检查上方的配置或环境错误。", 3: "有铁电候选等待选择，请查看候选报告。",
+           130: "操作已中断。"}.get(status, f"退出码 {status}"))
 
 
 def calculation_menu(option, selection):
     prop, label = CALCULATIONS[option]
     print(f"\n{label}")
     if prop == "optical":
-        print("清单中的光学任务若依赖力学结构，会一并执行所需的力学步骤。")
+        print("若清单要求使用力学平衡结构或铁电极性结构，会一并执行前置步骤。")
     print(" 1) 开始计算   2) 准备输入   0) 返回")
     action = choose("请选择操作 > ", {"0", "1", "2"})
     if action == "0":
@@ -132,7 +135,7 @@ def calculation_menu(option, selection):
 
 
 def show_summary(output):
-    candidates = [output / name for name in ("run-summary.json", "prepare-summary.json")]
+    candidates = [output / f"{action}-summary.json" for action in ("run", "prepare", "discover")]
     files = [path for path in candidates if path.is_file()]
     if not files:
         print(f"目录中还没有批次汇总\n{output}")
@@ -145,6 +148,9 @@ def show_summary(output):
         print(f"  {row['material']} / {prop}  [{row['status']}]")
         if message := row.get("message"):
             print(f"    {message}")
+        for field in ("result", "convergence_report"):
+            if link := row.get(field):
+                print(f"    {link}")
     if not report["stages"]:
         print("  还没有已报告的任务。")
     table = path.with_suffix(".csv")
@@ -161,7 +167,7 @@ def main(argv=None):
     try:
         while True:
             show_menu()
-            option = choose("请输入编号 > ", {*CALCULATIONS, "11", "12", "0"})
+            option = choose("请输入编号 > ", {*CALCULATIONS, "11", "12", "13", "0"})
             if option == "0":
                 return 0
             try:
@@ -169,6 +175,10 @@ def main(argv=None):
                     calculation_menu(option, selection)
                 elif option == "11":
                     run_in_menu(["doctor", str(selection.ask_manifest())])
+                elif option == "13":
+                    default = DISCOVERY if selection.manifest == EXAMPLE else selection.manifest
+                    manifest = selection.ask_manifest(default)
+                    run_in_menu(["discover", str(manifest), "--out", str(selection.ask_output())])
                 else:
                     show_summary(selection.ask_output())
             except (OSError, ValueError, KeyError, TypeError) as error:

@@ -18,6 +18,7 @@ from queue import SimpleQueue
 from threading import Event
 from xml.etree.ElementTree import ParseError
 
+from .convergence import ConvergenceOptions, mesh_levels, run_convergence
 from .inputs import build_inputs
 from .results import collect_result
 
@@ -79,7 +80,37 @@ def parser_arguments(cpu_count):
     parser.add_argument("--metal", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--component", choices=("tensor", "isotropic", "xx", "yy", "zz"))
     parser.add_argument("--incar", action="append", metavar="KEY=VALUE", help="allowed extra INCAR tag, repeatable")
+    conv = parser.add_argument_group("automatic convergence")
+    conv.add_argument("--converge", nargs="*", metavar="MATERIAL",
+                      help="refine these IDs after screening; omit IDs to refine all")
+    conv.add_argument("--conv-window", type=float, nargs=2, default=(0.0, 8.0),
+                      metavar=("MIN", "MAX"), help="comparison energy window in eV (default: 0 8)")
+    conv.add_argument("--conv-rtol", type=float, default=0.05, help="relative RMS tolerance (default: 0.05)")
+    conv.add_argument("--conv-atol", type=float, default=0.02, help="absolute RMS tolerance (default: 0.02)")
+    conv.add_argument("--conv-k-growth", type=float, default=1.4, help="automatic k-mesh multiplier (default: 1.4)")
+    conv.add_argument("--conv-k-steps", type=int, default=5, help="maximum automatic mesh increments (default: 5)")
+    conv.add_argument("--conv-kmesh", type=int, nargs=3, action="append", metavar=("NX", "NY", "NZ"),
+                      help="explicit refinement mesh; repeat to define the ladder after screening")
+    conv.add_argument("--conv-band-growth", type=float, default=1.4,
+                      help="multiplier for actual NBANDS (default: 1.4)")
+    conv.add_argument("--conv-band-steps", type=int, default=3,
+                      help="maximum NBANDS increments (default: 3)")
     return parser
+
+
+def selection_settings(args, materials):
+    if args.converge is None:
+        return set(), None
+    names = {material.name for material in materials}
+    selected = set(args.converge) if args.converge else names
+    if missing := selected - names:
+        raise ValueError(f"Unknown convergence material IDs: {', '.join(sorted(missing))}")
+    options = ConvergenceOptions(
+        tuple(args.conv_window), args.conv_rtol, args.conv_atol, args.conv_k_growth, args.conv_k_steps,
+        tuple(tuple(mesh) for mesh in args.conv_kmesh or ()), args.conv_band_growth, args.conv_band_steps,
+    )
+    options.validate()
+    return selected, options
 
 
 def merge_settings(*layers):
@@ -305,7 +336,7 @@ def launch(inputs, attempt, runner, cpu_group, stop):
                     shutil.copyfile(scratch / name, attempt / name)
 
 
-def process_material(job, root_potcar, runner, slots, stop):
+def process_material(job, root_potcar, runner, slots, stop, expected_structure=None):
     cpu_group = slots.get()
     state = {"material_id": job.name, "source": str(job.poscar)}
     attempt = None
@@ -314,6 +345,11 @@ def process_material(job, root_potcar, runner, slots, stop):
             raise ValueError("Interrupted before starting VASP")
         inputs = build_inputs(job.poscar, job.settings, job.potcar, None if job.potcar else root_potcar,
                               runner.ranks)
+        poscar_sha256 = hashlib.sha256(inputs.poscar).hexdigest()
+        if expected_structure is not None and expected_structure != (
+            poscar_sha256, inputs.metadata["potcar_sha256"]
+        ):
+            raise ValueError("POSCAR or POTCAR changed after screening; rerun the batch with fixed inputs")
         key = fingerprint(inputs, runner)
         directory = runner.output / job.name
         if directory.is_symlink():
@@ -323,13 +359,14 @@ def process_material(job, root_potcar, runner, slots, stop):
         if not runner.rerun:
             for _, previous in reversed(attempts):
                 if state_cached := cached_state(previous, key):
-                    return {**state_cached, "source": state["source"], "status": "reused"}
+                    return {**state_cached, **state, "status": "reused", "poscar_sha256": poscar_sha256,
+                            "attempt": str(previous.relative_to(runner.output))}
         number = attempts[-1][0] + 1 if attempts else 1
         attempt = directory / f"attempt-{number:04d}"
         attempt.mkdir()
         state.update({"status": "running", "fingerprint": key, "schema_version": SCHEMA_VERSION,
                       "attempt": str(attempt.relative_to(runner.output)), "inputs": inputs.metadata,
-                      "command": runner.command(), "cpu_group": cpu_group})
+                      "command": runner.command(), "cpu_group": cpu_group, "poscar_sha256": poscar_sha256})
         write_state(attempt, state)
         state["exit_code"] = launch(inputs, attempt, runner, cpu_group, stop)
         if state["exit_code"] != 0:
@@ -351,11 +388,14 @@ def process_material(job, root_potcar, runner, slots, stop):
 
 
 def write_summary(output, states):
+    states = list(states)
     results_fields = ("vasp_version", "kmesh", "nk_written", "ENCUT", "NBANDS", "elapsed_seconds",
                       "energy_min_eV", "energy_max_eV", "sampled_ks_gap_eV", "partial_occupation_count",
                       "drude_included")
     fields = ("material_id", "status", "source", "attempt", "spectrum", "dimension",
               *results_fields, "warnings", "message")
+    if any("convergence_status" in state for state in states):
+        fields += ("convergence_status", "convergence_attempt", "convergence_report", "convergence_message")
     temporary = output / "summary.csv.tmp"
     with temporary.open("w", encoding="utf-8", newline="") as target:
         writer = csv.DictWriter(target, fields)
@@ -373,13 +413,18 @@ def write_summary(output, states):
     temporary.replace(output / "summary.csv")
 
 
-def dry_run(materials, root_potcar, ranks):
+def dry_run(materials, root_potcar, ranks, selected, options):
     failed = False
     for job in materials:
         record = {"material_id": job.name, "source": str(job.poscar)}
         try:
             inputs = build_inputs(job.poscar, job.settings, job.potcar, None if job.potcar else root_potcar, ranks)
             record.update({"status": "ready", "inputs": inputs.metadata})
+            if job.name in selected:
+                record["convergence"] = {
+                    "window_eV": options.window, "rtol": options.rtol, "atol": options.atol,
+                    "mesh_ladder": mesh_levels(inputs.metadata, options), "band_steps_limit": options.band_steps,
+                }
         except (OSError, ValueError, EOFError) as exc:
             record.update({"status": "failed", "message": str(exc)})
             failed = True
@@ -387,7 +432,23 @@ def dry_run(materials, root_potcar, ranks):
     return int(failed)
 
 
-def run_batch(materials, root_potcar, runner, parallel_jobs, cpus):
+def process_convergence(job, baseline, root_potcar, runner, slots, stop, options):
+    def solve(settings):
+        material = Material(job.name, job.poscar, merge_settings(job.settings, settings), job.potcar)
+        signature = baseline["poscar_sha256"], baseline["inputs"]["potcar_sha256"]
+        return process_material(material, root_potcar, runner, slots, stop, signature)
+
+    try:
+        report = run_convergence(runner.output, baseline, options, solve,
+                                 lambda message: print(f"{job.name}: {message}", flush=True))
+    except (OSError, ValueError) as exc:
+        return {"convergence_status": "failed", "convergence_message": str(exc)}
+    return {"convergence_status": report["status"], "convergence_message": report["message"],
+            "convergence_attempt": report["final_attempt"],
+            "convergence_report": f"{job.name}/convergence.md"}
+
+
+def run_batch(materials, root_potcar, runner, parallel_jobs, cpus, selected, options):
     import fcntl
 
     runner.output.mkdir(parents=True, exist_ok=True)
@@ -402,6 +463,8 @@ def run_batch(materials, root_potcar, runner, parallel_jobs, cpus):
             slots.put(cpus[start:start + runner.ranks] if runner.taskset else [])
         states = [{"material_id": job.name, "source": str(job.poscar), "status": "queued"} for job in materials]
         state_by_name = {state["material_id"]: state for state in states}
+        for name in selected:
+            state_by_name[name]["convergence_status"] = "queued"
         write_summary(runner.output, state_by_name.values())
         stop = Event()
         with ThreadPoolExecutor(max_workers=parallel_jobs) as pool:
@@ -412,23 +475,38 @@ def run_batch(materials, root_potcar, runner, parallel_jobs, cpus):
                     pending[future] = job.name
                 for future in as_completed(pending):
                     result = future.result()
-                    state_by_name[result["material_id"]] = result
+                    state_by_name[result["material_id"]].update(result)
                     write_summary(runner.output, state_by_name.values())
                     detail = result.get("message") or result.get("attempt", "")
                     print(f"{result['material_id']}: {result['status']} {detail}", flush=True)
+                pending.clear()
+                for job in materials:
+                    if job.name in selected:
+                        future = pool.submit(process_convergence, job, state_by_name[job.name],
+                                             root_potcar, runner, slots, stop, options)
+                        pending[future] = job.name
+                for future in as_completed(pending):
+                    name = pending[future]
+                    result = future.result()
+                    state_by_name[name].update(result)
+                    write_summary(runner.output, state_by_name.values())
+                    print(f"{name}: {result['convergence_status']} {result['convergence_message']}", flush=True)
             except KeyboardInterrupt:
                 stop.set()
                 pool.shutdown(wait=True, cancel_futures=True)
                 for future, name in pending.items():
                     if not future.cancelled():
-                        state_by_name[name] = future.result()
+                        state_by_name[name].update(future.result())
                 for state in state_by_name.values():
                     if state["status"] == "queued":
                         state.update(status="failed", message="Interrupted before starting VASP")
+                    if state.get("convergence_status") == "queued":
+                        state.update(convergence_status="failed", convergence_message="Batch interrupted")
                 write_summary(runner.output, state_by_name.values())
                 print("Batch interrupted. Finished attempts are available for reuse.", file=sys.stderr)
                 return 130
-    return int(any(state["status"] == "failed" for state in state_by_name.values()))
+    return int(any(state["status"] == "failed" or state.get("convergence_status") in {"failed", "not_converged"}
+                   for state in state_by_name.values()))
 
 
 def main():
@@ -445,6 +523,7 @@ def main():
         parser.error("Launch this component inside WSL or Linux")
     try:
         materials = load_materials(args)
+        selected, options = selection_settings(args, materials)
         parallel_jobs = min(args.jobs, len(materials))
         if args.ranks * parallel_jobs > len(cpus):
             raise ValueError(f"Requested {args.ranks * parallel_jobs} CPUs, but {len(cpus)} are available")
@@ -452,9 +531,9 @@ def main():
         if root_potcar is not None:
             root_potcar = Path(root_potcar).expanduser().resolve()
         if args.dry_run:
-            return dry_run(materials, root_potcar, args.ranks)
+            return dry_run(materials, root_potcar, args.ranks, selected, options)
         runner = resolve_runner(args, parallel_jobs)
-        return run_batch(materials, root_potcar, runner, parallel_jobs, cpus)
+        return run_batch(materials, root_potcar, runner, parallel_jobs, cpus, selected, options)
     except (ValueError, OSError) as exc:
         parser.exit(2, f"{exc}\n")
     except KeyboardInterrupt:

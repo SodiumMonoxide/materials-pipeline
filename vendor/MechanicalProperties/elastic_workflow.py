@@ -18,6 +18,7 @@ import sys
 from ase.io import write
 
 from mech import VOIGT_ORDER, analyze_outcar, write_report
+from mechanical_convergence import converge_elastic
 from mechanical_fit import deformed_cell, fit_stress_strain
 from mechanical_inputs import normalize_incar, prepare_vasp_inputs, read_structure, write_incar
 from mechanical_vasp_output import read_run
@@ -39,6 +40,10 @@ DEFAULTS = {
     "ranks": 4, "kpar": 1, "ncore": 1, "threads": 1, "strain_workers": 1,
     "command": None, "strain": [0.005], "potim": 0.015, "nfree": 2,
     "ismear": 0, "sigma": 0.05, "relax_steps": 100, "relax_retries": 1, "incar": {},
+}
+CONVERGENCE_DEFAULTS = {
+    "converge": False, "convergence_tol_gpa": 1.0, "convergence_max_rounds": 3,
+    "convergence_k_step": 2, "convergence_encut_step": 80.0,
 }
 CONTROLLED_TAGS = {
     "ENCUT", "EDIFF", "EDIFFG", "IBRION", "ISIF", "NSW", "NFREE", "POTIM", "KSPACING",
@@ -234,15 +239,16 @@ def selected_method(settings, atoms):
     return "stress-strain" if len(atoms) > 12 or symmetry_off or needs_noncollinear_binary(settings) else "vasp"
 
 
-def run_material(source, directory, overrides=None, *, prepare_only=False):
-    """Prepare or run one ordered, periodic bulk structure; return a JSON-ready result."""
+def run_single_material(source, directory, overrides, *, prepare_only=False):
     source, directory = Path(source).resolve(), Path(directory).resolve()
-    settings = normalize_settings(overrides or {})
+    settings = normalize_settings(overrides)
     potcar_root = settings["potcar_root"] or os.environ.get("VASP_POTCAR_ROOT")
     if not potcar_root:
         raise ValueError("Set VASP_POTCAR_ROOT or pass a PAW-PBE library path")
     command = None if prepare_only else vasp_command(settings)
     with material_lock(directory):
+        if (directory / "convergence" / "baseline" / "workflow.json").exists():
+            raise ValueError(f"{directory} contains a convergence run; choose a new output directory for a single calculation")
         request = {**settings, "source": str(source), "potcar_root": str(Path(potcar_root).expanduser().resolve())}
         immutable_manifest(directory / "workflow.json", json.loads(json.dumps(request)))
         common = directory / "inputs"
@@ -321,6 +327,78 @@ def run_material(source, directory, overrides=None, *, prepare_only=False):
         return result
 
 
+def convergence_controls(overrides):
+    controls = {key: overrides.pop(key, value) for key, value in CONVERGENCE_DEFAULTS.items()}
+    if not isinstance(controls["converge"], bool):
+        raise ValueError("converge must be a boolean")
+    for key in ("convergence_k_step", "convergence_max_rounds"):
+        if type(controls[key]) is not int or controls[key] <= 0:
+            raise ValueError(f"{key} must be a positive integer")
+    for key in ("convergence_tol_gpa", "convergence_encut_step"):
+        value = controls[key]
+        if type(value) not in {int, float} or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{key} must be positive and finite")
+    return controls
+
+
+def run_convergence(source, directory, overrides, controls, *, prepare_only):
+    directory = Path(directory).resolve()
+    sweep = directory / "convergence"
+    with material_lock(directory):
+        if (directory / "workflow.json").exists():
+            raise ValueError(f"{directory} contains a single calculation; choose a new output directory for convergence")
+
+        baseline_dir = sweep / "baseline"
+        baseline = run_single_material(source, baseline_dir, overrides, prepare_only=prepare_only)
+        if prepare_only:
+            return {**baseline, "convergence": {"status": "prepared", "controls": controls}}
+        baseline_mesh = tuple(baseline["inputs"]["k_mesh"])
+        baseline_encut = baseline["inputs"]["encut_eV"]
+        baseline["result_path"] = (baseline_dir / "result.json").relative_to(directory).as_posix()
+        results = {(baseline_mesh, baseline_encut): baseline}
+
+        def evaluate(mesh, encut):
+            key = (tuple(mesh), encut)
+            if key not in results:
+                mesh_label = "x".join(map(str, mesh))
+                target = sweep / f"k-{mesh_label}_encut-{encut!r}"
+                print(f"Elastic convergence: mesh {mesh_label}, ENCUT {encut:g} eV", file=sys.stderr, flush=True)
+                result = run_single_material(source, target, {**overrides, "mesh": list(mesh), "encut": encut})
+                for label in ("structure_sha256", "potcar_sha256"):
+                    if result["inputs"][label] != baseline["inputs"][label]:
+                        raise ValueError(f"{label} changed during convergence at {target}; use a new output directory")
+                result["result_path"] = (target / "result.json").relative_to(directory).as_posix()
+                results[key] = result
+            return results[key]
+
+        report = converge_elastic(
+            evaluate, baseline_mesh, baseline_encut,
+            k_step=controls["convergence_k_step"], encut_step=controls["convergence_encut_step"],
+            tolerance_gpa=controls["convergence_tol_gpa"], max_rounds=controls["convergence_max_rounds"],
+        )
+        selected = report.pop("selected_result")
+        if selected is None:
+            last_base = report["last_base"]
+            selected = evaluate(last_base["mesh"], last_base["encut_eV"])
+        write_report(directory / "convergence.json", report)
+        result = {
+            **selected, "status": "ok" if report["status"] == "converged" else "not_converged",
+            "convergence": {"status": report["status"], "rounds": len(report["history"]),
+                            "report": "convergence.json"},
+        }
+        write_report(directory / "result.json", result)
+        return result
+
+
+def run_material(source, directory, overrides=None, *, prepare_only=False):
+    """Prepare or run one bulk structure, optionally checking tensor convergence."""
+    settings = dict(overrides or {})
+    controls = convergence_controls(settings)
+    if controls["converge"]:
+        return run_convergence(source, directory, settings, controls, prepare_only=prepare_only)
+    return run_single_material(source, directory, settings, prepare_only=prepare_only)
+
+
 def key_values(values, token):
     label, separator, value = token.partition("=")
     if not separator or not label or not value:
@@ -329,7 +407,7 @@ def key_values(values, token):
 
 
 def inputs_from_args(args):
-    cli = {key: getattr(args, key) for key in {*DEFAULTS, *PRESETS["standard"]}
+    cli = {key: getattr(args, key) for key in {*DEFAULTS, *PRESETS["standard"], *CONVERGENCE_DEFAULTS}
            if getattr(args, key, None) is not None}
     for key in ("incar", "potcars"):
         values = {}
@@ -392,6 +470,12 @@ def main():
     parser.add_argument("--format", help="ASE format for an ambiguous input filename")
     parser.add_argument("--mesh", type=int, nargs=3, metavar=("NX", "NY", "NZ"))
     parser.add_argument("--strain", action="append", type=float, metavar="AMPLITUDE")
+    parser.add_argument("--converge", action=argparse.BooleanOptionalAction, default=None,
+                        help="probe k mesh and ENCUT convergence of the elastic tensor")
+    parser.add_argument("--convergence-tol-gpa", type=float, help="maximum absolute change of any Cij; default 1 GPa")
+    parser.add_argument("--convergence-max-rounds", type=int, help="maximum probe pairs; default 3")
+    parser.add_argument("--convergence-k-step", type=int, help="add this many subdivisions on each axis; default 2")
+    parser.add_argument("--convergence-encut-step", type=float, help="increase ENCUT by this many eV; default 80")
     parser.add_argument("--materials-workers", type=int, default=1)
     for key in ("encut", "encut_factor", "k_spacing", "ediff", "force_tol", "stress_tol", "potim", "sigma"):
         parser.add_argument("--" + key.replace("_", "-"), type=float)
@@ -412,11 +496,16 @@ def main():
         try:
             result = run_material(source, directory, settings, prepare_only=args.prepare_only)
             tensor = result.get("elastic", {})
-            return {"id": identity, "structure": str(source), "status": result["status"], "method": result["method"],
+            item = {"id": identity, "structure": str(source), "status": result["status"], "method": result["method"],
                     "stability": tensor.get("stability"), "vrh": tensor.get("vrh"),
                     "max_asymmetry_GPa": tensor.get("max_asymmetry_GPa"),
                     "reference_max_abs_stress_GPa": result.get("reference_max_abs_stress_GPa"),
                     "result": f"{identity}/result.json" if not args.prepare_only else None}
+            if "convergence" in result:
+                item["convergence"] = result["convergence"].copy()
+                if not args.prepare_only:
+                    item["convergence"]["report"] = f"{identity}/convergence.json"
+            return item
         except (OSError, TypeError, ValueError, RuntimeError) as error:
             print(f"{identity}: {error}", file=sys.stderr)
             return {"id": identity, "structure": str(source), "status": "error", "error": str(error)}
@@ -427,11 +516,15 @@ def main():
             with ThreadPoolExecutor(max_workers=args.materials_workers) as pool:
                 results = list(pool.map(material, jobs.items()))
             errors = sum(item["status"] == "error" for item in results)
-            write_report(args.out / name, {"schema_version": 1, "errors": errors, "results": results})
+            batch = {"schema_version": 1, "errors": errors, "results": results}
+            not_converged = sum(item["status"] == "not_converged" for item in results)
+            if any("convergence" in item for item in results):
+                batch["not_converged"] = not_converged
+            write_report(args.out / name, batch)
     except (OSError, ValueError) as error:
         parser.error(str(error))
     print(args.out.resolve() / name)
-    return int(errors > 0)
+    return int(errors > 0 or not_converged > 0)
 
 
 if __name__ == "__main__":

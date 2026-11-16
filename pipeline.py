@@ -23,11 +23,13 @@ import threading
 
 ROOT = Path(__file__).resolve().parent
 STAGES = {
-    "mechanical": ("mechanical_adapter", "MechanicalProperties"),
     "ferroelectric": ("ferro_adapter", "ferroelectricity-dft"),
+    "mechanical": ("mechanical_adapter", "MechanicalProperties"),
     "optical": ("optical_adapter", "OpticalProperties"),
 }
-READY = {"completed", "review"}
+STRUCTURE_SOURCES = {"mechanical": {"ferroelectric"}, "optical": {"ferroelectric", "mechanical"}}
+STAGE_STATUSES = {"completed", "review", "prepared", "discovered", "needs_selection",
+                  "not_converged", "blocked", "failed"}
 RUNTIME_DEFAULTS = {
     "python": sys.executable,
     "vasp": os.environ.get("VASP_EXECUTABLE") or "vasp_std",
@@ -37,7 +39,10 @@ RUNTIME_DEFAULTS = {
     "ranks": 1,
     "threads": 1,
 }
-PATH_KEYS = {"reference", "polar", "opposite", "potcar", "potcar_root", "paw_dir"}
+PATH_KEYS = {"reference", "polar", "opposite", "potcar", "potcar_root", "paw_dir", "mp_cache"}
+MP_KEYS = {"formula", "material_id"}
+MECHANICAL_CONVERGENCE_CONTROLS = {"convergence_tol_gpa", "convergence_max_rounds",
+                                  "convergence_k_step", "convergence_encut_step"}
 
 
 def resolve_path(base, value):
@@ -118,7 +123,7 @@ def load_manifest(path):
             raise ValueError(f"Duplicate material id: {name}")
         if material.keys() - {"id", "structure", "properties"}:
             raise ValueError(f"{name}: expected id, structure and properties")
-        structure = resolve_path(path.parent, material.get("structure"))
+        structure = resolve_path(path.parent, material["structure"]) if "structure" in material else None
         props = object_value(material.get("properties"), f"{name}.properties")
         settings = {}
         for stage, value in props.items():
@@ -137,8 +142,13 @@ def load_manifest(path):
             raise ValueError(f"{name}: enable at least one property")
         for stage, values in settings.items():
             source = values.get("structure_from")
-            if source is not None and (stage != "optical" or source != "mechanical" or source not in settings):
-                raise ValueError(f"{name}.{stage}: structure_from requires an enabled mechanical stage and is only available for optical")
+            if source is not None:
+                if (not isinstance(source, str) or source not in STRUCTURE_SOURCES.get(stage, ())
+                        or source not in settings):
+                    raise ValueError(f"{name}.{stage}: structure_from must name an enabled upstream property")
+            elif structure is None and not (stage == "ferroelectric" and
+                                             values.keys() & (MP_KEYS | {"polar"})):
+                raise ValueError(f"{name}.{stage}: provide a structure or an upstream structure_from")
         items[name] = structure, settings
     return runtime, items
 
@@ -146,7 +156,7 @@ def load_manifest(path):
 @dataclass
 class Context:
     material_id: str
-    structure: Path
+    structure: Path | None
     settings: dict
     output: Path
     vendor: Path
@@ -157,9 +167,13 @@ class Context:
     vasp: str
     paw_dir: str | None
     mpi: str
-    prepare: bool
+    action: str
     cpus: tuple
     cancel: threading.Event
+
+    @property
+    def prepare(self):
+        return self.action == "prepare"
 
     def resolve(self, value):
         return resolve_path(self.base, value)
@@ -196,17 +210,26 @@ class Context:
             return 130
 
 
-def run_stage(name, stage, structure, settings, base, out, runtime, cpus, prepare, cancel):
+def run_stage(name, stage, structure, settings, base, out, runtime, cpus, action, cancel, ferro_source=None):
     record = {"material": name, "property": stage}
     try:
-        files = {"structure": {"path": str(structure), "sha256": sha256(structure)}}
+        if ferro_source is not None:
+            inherit_ferroelectric_potentials(stage, settings, ferro_source)
+        files = {}
+        if structure is not None:
+            files["structure"] = {"path": str(structure), "sha256": sha256(structure)}
         for key in sorted(PATH_KEYS & settings.keys()):
             if settings[key] is not None:
                 source = resolve_path(base, settings[key])
                 files[key] = {"path": str(source), "sha256": sha256(source) if source.is_file() else None}
         solver = {key: value for key, value in runtime.items() if key != "workers"}
         request = {"property": stage, "settings": settings, "inputs": files, "runtime": solver}
-        key = hashlib.sha256(json.dumps(request, sort_keys=True, allow_nan=False).encode()).hexdigest()[:20]
+        # Native workflows can reuse previously calculated points when convergence controls change.
+        ignored = {"convergence"} if stage == "optical" else set()
+        if stage == "mechanical" and settings.get("converge"):
+            ignored = MECHANICAL_CONVERGENCE_CONTROLS
+        identity = {**request, "settings": {k: v for k, v in settings.items() if k not in ignored}}
+        key = hashlib.sha256(json.dumps(identity, sort_keys=True, allow_nan=False).encode()).hexdigest()[:20]
         output = out / name / stage / key
         output.mkdir(parents=True, exist_ok=True)
         log = output / "driver.log"
@@ -214,22 +237,35 @@ def run_stage(name, stage, structure, settings, base, out, runtime, cpus, prepar
         write_json(output / "request.json", request)
         adapter, vendor = STAGES[stage]
         context = Context(name, structure, settings, output, ROOT / "vendor" / vendor,
-                          base, prepare=prepare, cpus=cpus, cancel=cancel, **solver)
+                          base, action=action, cpus=cpus, cancel=cancel, **solver)
         print(f"{name} / {stage} → {output}", flush=True)
         result = importlib.import_module(adapter).run(context)
-        if result.get("status") not in READY | {"prepared", "blocked", "failed"}:
+        if result.get("status") not in STAGE_STATUSES:
             raise ValueError(f"Invalid adapter status: {result!r}")
         record.update(result)
         if cancel.is_set():
             record.update(status="interrupted", message="Batch interrupted")
-        write_json(output / ("prepared.json" if prepare else "result.json"), record)
+        report_name = {"discover": "discovery.json", "prepare": "prepared.json", "run": "result.json"}[action]
+        write_json(output / report_name, record)
     except Exception as exc:
         record.update(status="failed", message=f"{type(exc).__name__}: {exc}")
     print(f"{name} / {stage}: {record['status']}", flush=True)
     return record
 
 
-def run_material(name, structure, properties, base, out, runtime, cpu_slots, prepare, cancel, publish):
+def inherit_ferroelectric_potentials(stage, settings, upstream):
+    variants = upstream.get("potential_variants", {})
+    if stage == "mechanical":
+        if variants:
+            settings["potcars"] = {**variants, **settings.get("potcars", {})}
+    else:
+        if variants:
+            settings["potentials"] = {**variants, **settings.get("potentials", {})}
+        if upstream.get("potcar") and not settings.get("potcar"):
+            settings["potcar"] = upstream["potcar"]
+
+
+def run_material(name, structure, properties, base, out, runtime, cpu_slots, action, cancel, publish):
     cpus = cpu_slots.get()
     records = {}
     try:
@@ -239,21 +275,25 @@ def run_material(name, structure, properties, base, out, runtime, cpu_slots, pre
             settings = dict(properties[stage])
             source = settings.pop("structure_from", None)
             stage_structure = structure
+            if stage == "ferroelectric" and settings.keys() & MP_KEYS:
+                settings.setdefault("mp_cache", str(out / name / stage / "mp-cache"))
             if cancel.is_set():
                 result = {"status": "interrupted", "message": "Batch interrupted"}
             elif source:
                 upstream = records[source]
-                # A mechanical review can mean residual stress or failed stability checks.
-                if prepare:
-                    result = {"status": "deferred", "message": f"Requires the structure from {source} during run"}
-                elif upstream["status"] != "completed" or not upstream.get("structure"):
-                    result = {"status": "blocked", "message": f"Requires a completed {source} stage with an equilibrium structure"}
-                else:
+                accepted = {"prepared"} if action == "prepare" else {"completed"}
+                if upstream["status"] in accepted and upstream.get("structure"):
                     stage_structure = Path(upstream["structure"])
-                    result = run_stage(name, stage, stage_structure, settings, base, out, runtime, cpus, prepare, cancel)
-                    result["structure_from"] = source
+                    result = run_stage(name, stage, stage_structure, settings, base, out, runtime, cpus, action, cancel,
+                                       ferro_source=upstream if source == "ferroelectric" else None)
+                elif action == "prepare" and upstream["status"] in {"prepared", "deferred"}:
+                    result = {"status": "deferred", "message": f"Requires the structure from {source} during run"}
+                else:
+                    result = {"status": "blocked", "upstream_status": upstream["status"],
+                              "message": f"Requires a usable structure from {source} ({upstream['status']})"}
+                result["structure_from"] = source
             else:
-                result = run_stage(name, stage, stage_structure, settings, base, out, runtime, cpus, prepare, cancel)
+                result = run_stage(name, stage, stage_structure, settings, base, out, runtime, cpus, action, cancel)
             records[stage] = {"material": name, "property": stage, **result}
             publish(records[stage])
     finally:
@@ -263,7 +303,8 @@ def run_material(name, structure, properties, base, out, runtime, cpu_slots, pre
 def write_summary(out, manifest, action, records):
     rows = sorted(records, key=lambda row: (row["material"], list(STAGES).index(row["property"])))
     write_json(out / f"{action}-summary.json", {"manifest": str(manifest), "stages": rows})
-    columns = ["material", "property", "status", "message", "directory", "result", "log", "structure", "structure_from"]
+    columns = ["material", "property", "status", "message", "directory", "result", "log", "structure",
+               "structure_from", "convergence_report", "convergence_status"]
     metric_names = sorted({f"metric.{key}" for row in rows for key in row.get("metrics", {})})
     temporary = out / f"{action}-summary.csv.tmp"
     with temporary.open("w", encoding="utf-8", newline="") as stream:
@@ -274,29 +315,30 @@ def write_summary(out, manifest, action, records):
     temporary.replace(out / f"{action}-summary.csv")
 
 
-def check_runtime(runtime, properties):
+def check_runtime(runtime, properties, *, discover, uses_mp):
     problems = []
-    for tool in ("python", "vasp", "mpi"):
+    for tool in (("python",) if discover else ("python", "vasp", "mpi")):
         value = runtime[tool]
         if not shutil.which(value):
             problems.append(f"{tool} is missing or not executable: {value}")
-    if not runtime["paw_dir"]:
+    if not discover and not runtime["paw_dir"]:
         problems.append("Set VASP_POTCAR_ROOT or runtime.paw_dir to your licensed PAW-PBE library")
-    elif not Path(runtime["paw_dir"]).is_dir():
+    elif not discover and not Path(runtime["paw_dir"]).is_dir():
         problems.append(f"PBE POTCAR library is missing: {runtime['paw_dir']}")
     if not shutil.which("taskset"):
         problems.append("taskset is missing")
-    if "mechanical" in properties and shutil.which(runtime["python"]):
-        check = subprocess.run([runtime["python"], "-B", "-c", "import ase, numpy, spglib"],
+    deps = "ase, numpy, spglib" if "mechanical" in properties else "numpy, spglib" if uses_mp else None
+    if deps and shutil.which(runtime["python"]):
+        check = subprocess.run([runtime["python"], "-B", "-c", f"import {deps}"],
                                capture_output=True, text=True)
         if check.returncode:
-            problems.append(f"Install ASE, NumPy and spglib in {runtime['python']}: {check.stderr.strip()}")
+            problems.append(f"Install {deps} in {runtime['python']}: {check.stderr.strip()}")
     return problems
 
 
 def main(argv=None, *, prog=None):
     parser = argparse.ArgumentParser(prog=prog, description=__doc__)
-    parser.add_argument("action", choices=("doctor", "prepare", "run"))
+    parser.add_argument("action", choices=("doctor", "discover", "prepare", "run"))
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--out", type=Path, help="Directory for generated inputs, job logs and results")
     parser.add_argument("--material", action="append", metavar="ID")
@@ -315,26 +357,32 @@ def main(argv=None, *, prog=None):
         if args.material and name not in args.material:
             continue
         properties = set(args.property or props) & props.keys()
-        for prop in list(properties):
-            if source := props[prop].get("structure_from"):
-                properties.add(source)
+        if args.action == "discover":
+            properties &= {"ferroelectric"} if props.get("ferroelectric", {}).keys() & MP_KEYS else set()
+        else:
+            for prop in reversed(STAGES):
+                if prop in properties and (source := props[prop].get("structure_from")):
+                    properties.add(source)
         if properties:
             selected[name] = structure, {key: props[key] for key in props if key in properties}
     if not selected:
         raise ValueError("No material/property combination selected")
     cpus = sorted(os.sched_getaffinity(0))
-    cores_per_worker = runtime["ranks"] * runtime["threads"]
+    discover = args.action == "discover"
+    cores_per_worker = 1 if discover else runtime["ranks"] * runtime["threads"]
     workers = min(runtime["workers"], len(selected))
     if workers * cores_per_worker > len(cpus):
         raise ValueError(f"{workers} workers × {cores_per_worker} logical CPUs exceeds {len(cpus)} available")
-    problems = check_runtime(runtime, {p for _, props in selected.values() for p in props})
+    uses_mp = any(props.get("ferroelectric", {}).keys() & MP_KEYS for _, props in selected.values())
+    problems = check_runtime(runtime, {p for _, props in selected.values() for p in props},
+                             discover=discover, uses_mp=uses_mp)
     if problems:
         raise ValueError("\n".join(problems))
     if args.action == "doctor":
         print(json.dumps({"status": "ready", "available_logical_cpus": len(cpus), **runtime}, indent=2))
         return 0
     if args.out is None:
-        parser.error("--out is required for run and prepare")
+        parser.error("--out is required for discover, prepare and run")
     out = args.out.expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
     cancel = threading.Event()
@@ -361,13 +409,17 @@ def main(argv=None, *, prog=None):
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = [executor.submit(run_material, name, structure, props, manifest.parent,
-                                       out, runtime, slots, args.action == "prepare", cancel, publish)
+                                       out, runtime, slots, args.action, cancel, publish)
                        for name, (structure, props) in selected.items()]
             for future in as_completed(futures):
                 future.result()
     if cancel.is_set():
         return 130
-    return int(any(row["status"] in {"failed", "blocked"} for row in records))
+    if any(row["status"] in {"failed", "not_converged"} or
+           (row["status"] == "blocked" and row.get("upstream_status") != "needs_selection")
+           for row in records):
+        return 1
+    return 3 if any(row["status"] == "needs_selection" for row in records) else 0
 
 
 def run_cli(argv=None, *, prog=None):
